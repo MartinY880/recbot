@@ -421,6 +421,16 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
   try {
     const filename = decodeURIComponent(req.params[0]);
     const BUCKET_NAME = process.env.AWS_BUCKET;
+    const region = process.env.AWS_REGION;
+    const forceNoCache = req.query.nocache === '1' || req.query.force === '1';
+    const debugMode = req.query.debug === '1';
+    const requestId = crypto.randomBytes(4).toString('hex');
+    const startedTs = Date.now();
+    console.log(`🎧 [AUDIO][${requestId}] Incoming stream request file="${filename}" bucket=${BUCKET_NAME} region=${region} forceNoCache=${forceNoCache}`);
+    if (!BUCKET_NAME) {
+      console.error(`❌ [AUDIO][${requestId}] AWS_BUCKET not configured`);
+      return res.status(500).json({ error: 'Audio storage not configured' });
+    }
     
     console.log(`🎵 [STREAMING AUTH] User ${req.user.email} (${req.user.role || 'no-role'}) streaming: ${filename}`);
 
@@ -432,36 +442,46 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
     console.log(`📁 [CACHE KEY] Audio: ${cacheKey}, Waveform: ${waveformCacheKey}`);
 
     // Check if already cached
-    try {
-      await s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: cacheKey }));
-      
-      console.log(`⚡ [CACHE HIT] Serving from cache: ${cacheKey}`);
-      // Mark cacheHit for later single audit emission
-      req._playAudit = { cacheHit: true };
-      const range = req.headers.range;
-      const params = { Bucket: BUCKET_NAME, Key: cacheKey };
-      if (range) {
-        params.Range = range;
-        res.status(206);
+    if (!forceNoCache) {
+      try {
+        const headStarted = Date.now();
+        const headPromise = s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: cacheKey }));
+        // Add a 5s timeout to avoid indefinite hang
+        const headResult = await Promise.race([
+          headPromise,
+          new Promise((_, reject) => setTimeout(()=> reject(new Error('Head timeout after 5000ms')), 5000))
+        ]);
+        if (headResult) {
+          console.log(`⚡ [CACHE HIT][${requestId}] Found cached file in ${Date.now()-headStarted}ms: ${cacheKey}`);
+          req._playAudit = { cacheHit: true };
+          const range = req.headers.range;
+          const params = { Bucket: BUCKET_NAME, Key: cacheKey };
+          if (range) {
+            params.Range = range;
+            res.status(206);
+          }
+          const cachedCommand = new GetObjectCommand(params);
+            const cachedFetchStart = Date.now();
+          const cachedResponse = await s3.send(cachedCommand);
+          console.log(`⚡ [CACHE FETCH][${requestId}] Stream start after ${Date.now()-cachedFetchStart}ms`);
+          res.setHeader('Content-Type', 'audio/wav');
+          res.setHeader('Accept-Ranges', 'bytes');
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
+          if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
+          if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
+          cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
+          res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
+          cachedResponse.Body.pipe(res);
+          return;
+        }
+      } catch (e) {
+        console.log(`📦 [CACHE MISS][${requestId}] (${e.message}) Need to convert: ${s3Key}`);
+        req._playAudit = { cacheHit: false, headError: e.message };
       }
-      
-      const cachedCommand = new GetObjectCommand(params);
-      const cachedResponse = await s3.send(cachedCommand);
-
-      res.setHeader('Content-Type', 'audio/wav');
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
-      
-      if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
-      if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
-
-      cachedResponse.Body.pipe(res);
-      return;
-      
-    } catch {
-      console.log(`📦 [CACHE MISS] Need to convert and cache: ${s3Key}`);
-      req._playAudit = { cacheHit: false };
+    } else {
+      console.log(`🚫 [CACHE BYPASS][${requestId}] Forced conversion due to query param`);
+      req._playAudit = { cacheHit: false, forced: true };
     }
 
     // Emit a single consolidated PLAY_FILE audit event now that we know cache hit/miss
@@ -485,15 +505,28 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
 
     // Get the original file from S3
     const s3StartTime = Date.now();
-    const originalCommand = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key });
-    const originalResponse = await s3.send(originalCommand);
-    const s3FetchTime = Date.now() - s3StartTime;
-    console.log(`📦 [S3 FETCH] Retrieved file in ${s3FetchTime}ms`);
+    let originalResponse;
+    try {
+      const originalCommand = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key });
+      // Implement manual timeout using AbortController (AWS SDK v3 supports abortSignal)
+      const controller = new AbortController();
+      const timeoutMs = parseInt(process.env.AUDIO_S3_TIMEOUT_MS || '20000', 10);
+      const tHandle = setTimeout(() => {
+        controller.abort();
+      }, timeoutMs);
+      originalResponse = await s3.send(originalCommand, { abortSignal: controller.signal });
+      clearTimeout(tHandle);
+      const s3FetchTime = Date.now() - s3StartTime;
+      console.log(`📦 [S3 FETCH][${requestId}] Retrieved file in ${s3FetchTime}ms size=${originalResponse.ContentLength || 'unknown'} timeoutMs=${timeoutMs}`);
+    } catch (e) {
+      console.error(`❌ [S3 FETCH FAIL][${requestId}] ${e.name||''} ${e.message}`);
+      return res.status(404).json({ error: 'Original file not found', detail: e.message });
+    }
 
     // Convert and cache for seeking support
     const tmpCachePath = path.join(os.tmpdir(), cacheKey.replace(/\//g, '_'));
     
-    console.log(`🔄 [CONVERT] Starting FFmpeg WAV conversion: ${s3Key}`);
+  console.log(`🔄 [CONVERT][${requestId}] Starting FFmpeg WAV conversion: ${s3Key}`);
     const conversionStartTime = Date.now();
     
     // Ensure we do not exceed concurrent ffmpeg processes
@@ -501,7 +534,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
     
     const ffmpegArgs = [
       '-hide_banner',
-      '-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning',
+      '-loglevel', debugMode ? 'info' : (process.env.FFMPEG_LOGLEVEL || 'warning'),
       '-nostdin',
       '-i', 'pipe:0',            // Input from stdin
       '-fflags', '+discardcorrupt',
@@ -513,21 +546,21 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
       '-y',                      // overwrite temp file if exists
       tmpCachePath
     ];
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+  console.log(`🎬 [FFMPEG SPAWN][${requestId}] cmd=ffmpeg args=${ffmpegArgs.join(' ')}`);
 
     // Error handling
     ffmpeg.stderr.on('data', (data) => {
       const msg = data.toString();
-      // Suppress repetitive benign warnings while keeping them visible for diagnostics
       if (/Packet is too small/i.test(msg)) {
-        console.warn(`⚠️  [FFmpeg WARN] ${msg.trim()}`);
+        console.warn(`⚠️  [FFmpeg WARN][${requestId}] ${msg.trim()}`);
       } else {
-        console.error(`FFmpeg stderr: ${msg}`);
+        console.log(`[FFmpeg][stderr][${requestId}] ${msg.trim()}`);
       }
     });
 
     ffmpeg.on('error', (error) => {
-      console.error('❌ [FFmpeg ERROR]:', error);
+      console.error(`❌ [FFmpeg ERROR][${requestId}]:`, error);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Audio conversion failed' });
       }
@@ -536,11 +569,25 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
     });
 
     // Stream input to FFmpeg
+    let sourceEnded = false;
+    originalResponse.Body.on('error', e => {
+      console.error(`❌ [S3 BODY ERR][${requestId}]`, e.message);
+      try { ffmpeg.stdin.destroy(e); } catch {}
+    });
+    originalResponse.Body.on('end', () => {
+      sourceEnded = true;
+      console.log(`📥 [S3 BODY END][${requestId}] upstream complete`);
+      try { ffmpeg.stdin.end(); } catch {}
+    });
     originalResponse.Body.pipe(ffmpeg.stdin);
+    console.log(`🔌 [PIPE][${requestId}] S3->FFmpeg piping established`);
 
     ffmpeg.on('close', async (code) => {
       const conversionTime = Date.now() - conversionStartTime;
-      console.log(`⏱️ [CONVERSION] Completed in ${conversionTime}ms`);
+      console.log(`⏱️ [CONVERSION][${requestId}] Completed in ${conversionTime}ms exitCode=${code}`);
+      if (!sourceEnded) {
+        console.log(`⚠️ [CONVERSION][${requestId}] FFmpeg closed before source end (sourceEnded=${sourceEnded})`);
+      }
       
       // Even if non-zero, sometimes partial output exists; validate file size
       let tmpOk = false;
@@ -551,7 +598,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
         }
       } catch {}
       if (code !== 0 && !tmpOk) {
-        console.error(`❌ FFmpeg exited with code ${code} and no usable output.`);
+  console.error(`❌ [FFMPEG BAD OUTPUT][${requestId}] exitCode=${code} sizeInvalid`);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Failed to convert audio' });
         }
@@ -570,7 +617,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           ContentType: 'audio/wav'
         }));
         
-        console.log(`✅ [CACHED] Uploaded to S3 cache: ${cacheKey}`);
+  console.log(`✅ [CACHED][${requestId}] Uploaded to S3 cache: ${cacheKey} size=${fileData.length}`);
         
         // Now serve the file with range support
         const range = req.headers.range;
@@ -588,6 +635,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           res.setHeader('Accept-Ranges', 'bytes');
           
           res.end(fileData.slice(start, end + 1));
+          console.log(`📤 [RANGE SERVE][${requestId}] bytes=${chunksize} range=${start}-${end}`);
         } else {
           // Serve full file
           res.setHeader('Content-Type', 'audio/wav');
@@ -597,6 +645,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
           
           res.end(fileData);
+          console.log(`📤 [FULL SERVE][${requestId}] bytes=${fileData.length}`);
         }
         
         // Clean up temp file
@@ -610,6 +659,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
         if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
       }
       releaseFfmpegSlot();
+      console.log(`🏁 [AUDIO DONE][${requestId}] totalMs=${Date.now()-startedTs}`);
     });
   } catch (err) {
     console.error('Error streaming S3 file:', err);
