@@ -116,7 +116,7 @@ export default function ReportsPage(){
     else if (p==='yesterday') { const y = now.subtract(1,'day'); setStart(y.startOf('day').toISOString()); setEnd(y.endOf('day').toISOString()); }
     else if (p==='last24h') { setStart(now.subtract(24,'hour').toISOString()); setEnd(now.toISOString()); }
     else if (p==='clear') { setStart(''); setEnd(''); }
-    setTimeout(()=>{ setPage(1); fetchReports(); },0);
+    // Don't call fetchReports() directly - let the useEffect handle it when filters change
   }
 
   return <Container maxWidth="xl" sx={{ mt:3 }}>
