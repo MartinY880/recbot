@@ -21,6 +21,7 @@ export default function ReportsPage(){
   const [start,setStart]=useState('');
   const [end,setEnd]=useState('');
   const [page,setPage]=useState(1); const [pageSize,setPageSize]=useState(50); const [total,setTotal]=useState(0);
+  const [initialized,setInitialized]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
 
   const fetchReports = React.useCallback(async () => {
@@ -28,8 +29,8 @@ export default function ReportsPage(){
     try {
       const token = await getToken();
       const params = new URLSearchParams();
-  if (start) params.append('start', start);
-  if (end) params.append('end', end);
+      if (start) params.append('start', start);
+      if (end) params.append('end', end);
       if (agent) params.append('agent', agent);
       if (campaign) params.append('campaign', campaign);
       // Append remaining optional filters
@@ -59,7 +60,29 @@ export default function ReportsPage(){
     } catch(e){ setError(e.message); } finally { setLoading(false); }
   };
 
-  useEffect(() => { fetchReports(); }, [fetchReports]);
+  const fixTimezones = async () => {
+    if(!isAdmin) return;
+    if(!window.confirm('This will convert ALL existing timestamps from Five9 timezone to UTC. This may take a minute for large datasets. Continue?')) return;
+    setLoading(true); setError(null);
+    try {
+      const token=await getToken();
+      const res = await fetch('/api/reports/fix-timezones', { 
+        method:'POST', 
+        headers:{ 'Content-Type':'application/json', Authorization:`Bearer ${token}` },
+        body: JSON.stringify({ batchSize: 10000, runAll: true })
+      });
+      const json = await res.json(); 
+      if(!res.ok) throw new Error(json.error||'Timezone fix failed');
+      alert(`Success: ${json.updated} timestamps converted to UTC across ${json.batches} batch(es)\nProcessed: ${json.processed} rows\nErrors: ${json.errors}`);
+      await fetchReports();
+    } catch(e){ setError(e.message); } finally { setLoading(false); }
+  };
+
+  useEffect(() => { 
+    if (initialized) {
+      fetchReports(); 
+    }
+  }, [fetchReports, initialized]);
   useEffect(() => {
     (async () => {
       try {
@@ -73,6 +96,17 @@ export default function ReportsPage(){
       } catch {/* ignore meta errors */}
     })();
   }, [getToken]);
+
+  // Set default preset to 'lastHour' on mount
+  useEffect(() => {
+    applyPreset('lastHour');
+    setInitialized(true);
+  }, []);
+
+  // Reset page to 1 when filters change to avoid empty result pages
+  useEffect(() => {
+    setPage(1);
+  }, [agent, campaign, callType, ani, dnis, start, end]);
 
 
   function applyPreset(p){
@@ -91,23 +125,23 @@ export default function ReportsPage(){
       <Stack direction="row" flexWrap="wrap" spacing={1} alignItems="flex-end">
         <TextField label="Start ISO" value={start} onChange={e=>setStart(e.target.value)} size="small" sx={{ minWidth:240 }} />
         <TextField label="End ISO" value={end} onChange={e=>setEnd(e.target.value)} size="small" sx={{ minWidth:240 }} />
-        <TextField label="Agent" value={agent} onChange={e=>{ setAgent(e.target.value); setPage(1); }} size="small" />
+        <TextField label="Agent" value={agent} onChange={e=>setAgent(e.target.value)} size="small" />
         <FormControl size="small" sx={{ minWidth:160 }}>
           <InputLabel id="campaign-label">Campaign</InputLabel>
-          <Select labelId="campaign-label" value={campaign} label="Campaign" onChange={e=>{ setCampaign(e.target.value); setPage(1); }}>
+          <Select labelId="campaign-label" value={campaign} label="Campaign" onChange={e=>setCampaign(e.target.value)}>
             <MenuItem value=""><em>All</em></MenuItem>
             {campaigns.map(c=> <MenuItem key={c} value={c}>{c}</MenuItem>)}
           </Select>
         </FormControl>
         <FormControl size="small" sx={{ minWidth:160 }}>
           <InputLabel id="calltype-label">Call Type</InputLabel>
-          <Select labelId="calltype-label" value={callType} label="Call Type" onChange={e=>{ setCallType(e.target.value); setPage(1); }}>
+          <Select labelId="calltype-label" value={callType} label="Call Type" onChange={e=>setCallType(e.target.value)}>
             <MenuItem value=""><em>All</em></MenuItem>
             {callTypes.map(t=> <MenuItem key={t} value={t}>{t}</MenuItem>)}
           </Select>
         </FormControl>
-        <TextField label="ANI" value={ani} onChange={e=>{ setAni(e.target.value); setPage(1); }} size="small" />
-        <TextField label="DNIS" value={dnis} onChange={e=>{ setDnis(e.target.value); setPage(1); }} size="small" />
+        <TextField label="ANI" value={ani} onChange={e=>setAni(e.target.value)} size="small" />
+        <TextField label="DNIS" value={dnis} onChange={e=>setDnis(e.target.value)} size="small" />
         <Button variant="contained" onClick={()=>{ setPage(1); fetchReports(); }} disabled={loading}>Apply</Button>
         <Button variant="text" onClick={()=>{ setAgent(''); setCampaign(''); setCallType(''); setAni(''); setDnis(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
@@ -115,6 +149,7 @@ export default function ReportsPage(){
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('last24h')} disabled={loading}>Last 24h</Button>
         {isAdmin && <Button variant="outlined" color="secondary" onClick={ingest} disabled={loading}>Ingest Last Hour</Button>}
+        {isAdmin && <Button variant="outlined" color="warning" onClick={fixTimezones} disabled={loading}>Fix Timezones</Button>}
       </Stack>
       {error && <Alert severity="error" sx={{ mt:2 }}>{error}</Alert>}
     </Paper>

@@ -208,10 +208,108 @@ app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async 
   }
 });
 
+// Endpoint to fix timezone on existing reporting data (admin only, one-time migration)
+app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const dayjs = (await import('dayjs')).default;
+    const utc = (await import('dayjs/plugin/utc.js')).default;
+    const timezone = (await import('dayjs/plugin/timezone.js')).default;
+    dayjs.extend(utc);
+    dayjs.extend(timezone);
+    
+    const sourceTimezone = req.body.sourceTimezone || process.env.FIVE9_TIMEZONE || 'America/New_York';
+    const batchSize = parseInt(req.body.batchSize || '10000', 10);
+    const runAll = req.body.runAll !== false; // default true
+    
+    console.log(`[TIMEZONE FIX] Starting migration from ${sourceTimezone} to UTC, batch size: ${batchSize}, runAll: ${runAll}`);
+    
+    const { db } = await import('./database.js');
+    
+    let totalUpdated = 0;
+    let totalProcessed = 0;
+    let totalErrors = 0;
+    let batchCount = 0;
+    
+    const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
+    
+    do {
+      batchCount++;
+      // Get rows that look like they haven't been converted yet (no 'T' or 'Z' in timestamp, or specific patterns)
+      // Or just process all rows - the update will only happen if timestamp changes
+      const rows = db.prepare(`SELECT call_id, timestamp FROM reporting WHERE timestamp IS NOT NULL ORDER BY datetime(timestamp) DESC LIMIT ? OFFSET ?`).all(batchSize, totalProcessed);
+      
+      if (rows.length === 0) {
+        console.log(`[TIMEZONE FIX] No more rows to process`);
+        break;
+      }
+      
+      console.log(`[TIMEZONE FIX] Batch ${batchCount}: Processing ${rows.length} rows (offset ${totalProcessed})`);
+      
+      let batchUpdated = 0;
+      let batchErrors = 0;
+      
+      for (const row of rows) {
+        try {
+          // Parse as if it's in the source timezone, then convert to UTC
+          const parsed = dayjs.tz(row.timestamp, sourceTimezone);
+          if (parsed.isValid()) {
+            const utcIso = parsed.utc().toISOString();
+            // Only update if actually different
+            if (utcIso !== row.timestamp) {
+              updateStmt.run(utcIso, row.call_id);
+              batchUpdated++;
+              if (totalUpdated < 5) {
+                console.log(`[TIMEZONE FIX] ${row.call_id}: "${row.timestamp}" -> "${utcIso}"`);
+              }
+            }
+          } else {
+            batchErrors++;
+          }
+        } catch (e) {
+          batchErrors++;
+        }
+      }
+      
+      totalProcessed += rows.length;
+      totalUpdated += batchUpdated;
+      totalErrors += batchErrors;
+      
+      console.log(`[TIMEZONE FIX] Batch ${batchCount} complete: ${batchUpdated} updated, ${batchErrors} errors. Total so far: ${totalUpdated}/${totalProcessed}`);
+      
+      if (!runAll) {
+        // Single batch mode
+        break;
+      }
+      
+      // Continue if there might be more rows
+      if (rows.length < batchSize) {
+        console.log(`[TIMEZONE FIX] Last batch was smaller than batch size, done`);
+        break;
+      }
+      
+    } while (runAll);
+    
+    console.log(`[TIMEZONE FIX] Complete: ${totalUpdated} rows updated out of ${totalProcessed} processed, ${totalErrors} errors`);
+    
+    res.json({ 
+      success: true, 
+      processed: totalProcessed, 
+      updated: totalUpdated,
+      errors: totalErrors,
+      batches: batchCount,
+      message: `Converted ${totalUpdated} timestamps from ${sourceTimezone} to UTC across ${batchCount} batch(es)`
+    });
+  } catch (e) {
+    console.error('[TIMEZONE FIX] Error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
     const { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0 } = req.query;
+    console.log(`[API /api/reports] Raw query params: start="${start}", end="${end}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
     const result = queryReports({ start: start || null, end: end || null, agent: agent || null, campaign: campaign || null, callType: callType || null, ani: ani || null, dnis: dnis || null, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
     try {
       logAuditEvent(

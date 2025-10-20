@@ -1,7 +1,14 @@
 import axios from 'axios';
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc.js';
+import timezone from 'dayjs/plugin/timezone.js';
+import customParseFormat from 'dayjs/plugin/customParseFormat.js';
 import { XMLParser } from 'fast-xml-parser';
 import { bulkUpsertReports, logAuditEvent } from './database.js';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dayjs.extend(customParseFormat);
 
 // Five9 SOAP Admin service basic client (minimal methods needed)
 // We manually craft SOAP envelopes to avoid adding heavy dependencies.
@@ -12,6 +19,8 @@ const FIVE9_PASSWORD = process.env.FIVE9_PASSWORD;
 // Default Five9 API version updated to 9.5 per specification
 const FIVE9_VERSION = process.env.FIVE9_WSDL_VERSION || '9.5';
 const FIVE9_BASE = process.env.FIVE9_BASE || 'https://api.five9.com/wsadmin';
+// Timezone for Five9 report timestamps (defaults to America/New_York, adjust as needed)
+const FIVE9_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/New_York';
 
 if (!FIVE9_USERNAME || !FIVE9_PASSWORD) {
   console.warn('⚠️  Five9 credentials not set. Reporting ingestion disabled.');
@@ -284,6 +293,7 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   const header = lines.shift().split(',').map(h=>h.trim().replace(/^"|"$/g,''));
 
   const rows = [];
+  let timestampSamples = [];
   for (const line of lines) {
     const cols = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(c=>c.trim().replace(/^"|"$/g,''));
     // Basic mapping by header names (normalize to uppercase without spaces for matching)
@@ -303,13 +313,26 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
         'MM/DD/YY hh:mm:ss A'
       ];
       for (const fmt of candidates) {
-        const d = dayjs(tsRaw, fmt, true);
-        if (d.isValid()) { tsIso = d.toDate().toISOString(); break; }
+        // Parse in Five9's timezone, then convert to UTC ISO
+        const d = dayjs.tz(tsRaw, fmt, FIVE9_TIMEZONE);
+        if (d.isValid()) { 
+          tsIso = d.utc().toISOString();
+          // Log first 3 samples for verification
+          if (timestampSamples.length < 3) {
+            timestampSamples.push({ raw: tsRaw, format: fmt, utc: tsIso });
+          }
+          break; 
+        }
       }
       if (!tsIso) {
-        // Fallback: let Date try parsing
+        // Fallback: let Date try parsing (assumes local/browser timezone, not ideal)
         const d2 = new Date(tsRaw);
-        if (!isNaN(d2.getTime())) tsIso = d2.toISOString();
+        if (!isNaN(d2.getTime())) {
+          tsIso = d2.toISOString();
+          if (timestampSamples.length < 3) {
+            timestampSamples.push({ raw: tsRaw, format: 'fallback', utc: tsIso, warning: 'Used fallback parser' });
+          }
+        }
       }
     }
     rows.push({
@@ -341,6 +364,16 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
       raw_json: JSON.stringify(map)
     });
   }
+  
+  // Log timestamp conversion summary
+  if (timestampSamples.length > 0) {
+    console.log(`🕐 [Five9][TIMESTAMP CONVERSION] Timezone: ${FIVE9_TIMEZONE} -> UTC`);
+    timestampSamples.forEach((sample, idx) => {
+      const warning = sample.warning ? ` ⚠️ ${sample.warning}` : '';
+      console.log(`   Sample ${idx + 1}: "${sample.raw}" [${sample.format}] -> "${sample.utc}"${warning}`);
+    });
+  }
+  
   const inserted = bulkUpsertReports(rows);
   console.log(`🗂️  [Five9] Upserted ${inserted}/${rows.length} rows into reporting`);
   if (auditUser) {

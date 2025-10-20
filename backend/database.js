@@ -491,6 +491,19 @@ statements.countReports = db.prepare(`
     AND (? IS NULL OR dnis LIKE '%' || ? || '%');
 `);
 
+// Test datetime filtering on startup to verify ISO timestamp handling
+try {
+  const testRow = db.prepare(`SELECT timestamp FROM reporting LIMIT 1`).get();
+  if (testRow) {
+    console.log(`[REPORTING] Sample timestamp from DB: "${testRow.timestamp}"`);
+    const testDate = '2025-10-20T17:00:00.000Z';
+    const testResult = db.prepare(`SELECT COUNT(*) as count FROM reporting WHERE datetime(timestamp) >= datetime(?)`).get(testDate);
+    console.log(`[REPORTING] Test query with ${testDate}: ${testResult.count} rows match`);
+  }
+} catch (e) {
+  console.warn('[REPORTING] Datetime test query failed:', e.message);
+}
+
 // Additional maintenance statements for backfilling missing call_id values on audit_logs
 try {
   statements.getAuditLogsNeedingCallId = db.prepare(`
@@ -1037,8 +1050,13 @@ export function queryReports({ start=null, end=null, agent=null, campaign=null, 
     const ct = norm(callType);
     const an = norm(ani);
     const dn = norm(dnis);
+    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, campaign=${c}, callType=${ct}, ani=${an}, dnis=${dn}, limit=${limit}, offset=${offset}`);
     const rows = statements.queryReports.all(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn, limit, offset);
     const { total } = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn);
+    console.log(`[QUERY REPORTS] Results: returned ${rows.length} rows, total=${total}`);
+    if (rows.length > 0) {
+      console.log(`[QUERY REPORTS] First row timestamp: ${rows[0].timestamp}, Last row timestamp: ${rows[rows.length-1].timestamp}`);
+    }
     return { rows, total };
   } catch (e) {
     console.error('Failed to query reports', e);
