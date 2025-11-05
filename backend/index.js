@@ -5,6 +5,8 @@ import crypto from 'crypto';
 import dayjs from 'dayjs';
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
 import isSameOrBefore from 'dayjs/plugin/isSameOrBefore.js';
+import utcPlugin from 'dayjs/plugin/utc.js';
+import timezonePlugin from 'dayjs/plugin/timezone.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -15,16 +17,24 @@ import {
   PutObjectCommand,
   HeadObjectCommand
 } from "@aws-sdk/client-s3";
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds } from './database.js';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import http from 'http';
+import https from 'https';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport } from './database.js';
+import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isSameOrBefore);
+dayjs.extend(utcPlugin);
+dayjs.extend(timezonePlugin);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const BUILD_DIR = path.join(process.cwd(), '../frontend/build');
 const WAV_DIR = '/data/wav/recordings'; // For reference, not used with S3
+
+const REPORT_FILTER_FALLBACK_TIMEZONE = process.env.REPORTS_QUERY_TIMEZONE || process.env.FIVE9_TIMEZONE || 'UTC';
 
 app.use(cors());
 app.use(express.json()); // Parse JSON request bodies
@@ -68,7 +78,126 @@ app.use(async (req, res, next) => {
   return next();
 });
 
-const s3 = new S3Client({ region: process.env.AWS_REGION });
+// Tunable S3 HTTP configuration to avoid socket exhaustion under heavy parallel audio/waveform requests
+const S3_MAX_SOCKETS = parseInt(process.env.S3_MAX_SOCKETS || '200', 10); // default 50 -> raise
+const S3_SOCKET_TIMEOUT_MS = parseInt(process.env.S3_SOCKET_TIMEOUT_MS || '60000', 10);
+const S3_CONNECTION_TIMEOUT_MS = parseInt(process.env.S3_CONNECTION_TIMEOUT_MS || '10000', 10);
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  requestHandler: new NodeHttpHandler({
+    connectionTimeout: S3_CONNECTION_TIMEOUT_MS,
+    socketTimeout: S3_SOCKET_TIMEOUT_MS,
+    httpAgent: new http.Agent({ keepAlive: true, maxSockets: S3_MAX_SOCKETS }),
+    httpsAgent: new https.Agent({ keepAlive: true, maxSockets: S3_MAX_SOCKETS })
+  })
+});
+console.log(`[S3] Client initialized region=${process.env.AWS_REGION} maxSockets=${S3_MAX_SOCKETS} socketTimeoutMs=${S3_SOCKET_TIMEOUT_MS}`);
+
+// Lightweight HEAD cache to reduce duplicate S3 HeadObject traffic (TTL 60s)
+const headCacheTTL = parseInt(process.env.S3_HEAD_CACHE_TTL_MS || '60000', 10);
+const headCache = new Map(); // key -> { ts, exists }
+function headCacheGet(key){
+  const v = headCache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.ts > headCacheTTL){ headCache.delete(key); return null; }
+  return v.exists;
+}
+function headCacheSet(key, exists){ headCache.set(key, { ts: Date.now(), exists }); }
+
+// Concurrency limiter for audio S3 operations (avoid enqueuing hundreds exceeding socket capacity)
+const AUDIO_S3_MAX_CONCURRENT = parseInt(process.env.AUDIO_S3_MAX_CONCURRENT || '30', 10);
+let audioS3Active = 0; const audioS3Queue = [];
+function acquireAudioS3(){
+  return new Promise(resolve => {
+    const tryStart = () => {
+      if (audioS3Active < AUDIO_S3_MAX_CONCURRENT){ audioS3Active++; resolve(); return true; }
+      return false;
+    };
+    if (!tryStart()) audioS3Queue.push(tryStart);
+  });
+}
+function releaseAudioS3(){
+  audioS3Active = Math.max(0, audioS3Active - 1);
+  while (audioS3Queue.length && audioS3Active < AUDIO_S3_MAX_CONCURRENT){
+    const starter = audioS3Queue.shift();
+    if (starter) starter();
+  }
+}
+setInterval(()=>{
+  if (audioS3Active) console.log(`[AUDIO S3] active=${audioS3Active} queued=${audioS3Queue.length}`);
+}, 15000);
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (str.length === 0) return '';
+  const needsQuotes = /[",\n\r]/.test(str);
+  const escaped = str.replace(/"/g, '""');
+  return needsQuotes ? `"${escaped}"` : escaped;
+}
+
+function buildCsv(rows, columns) {
+  const headerLine = columns.map(col => escapeCsvValue(col.header)).join(',');
+  const dataLines = rows.map(row => columns.map(col => {
+    if (typeof col.accessor === 'function') {
+      return escapeCsvValue(col.accessor(row));
+    }
+    return escapeCsvValue(row[col.key]);
+  }).join(','));
+  return [headerLine, ...dataLines].join('\r\n');
+}
+
+function normalizeFilterToUtc(value, preferredTz = REPORT_FILTER_FALLBACK_TIMEZONE) {
+  if (!value) return null;
+  const trimmed = typeof value === 'string' ? value.trim() : String(value).trim();
+  if (!trimmed) return null;
+
+  const hasOffset = /Z$/i.test(trimmed) || /([+-]\d{2}:?\d{2})$/.test(trimmed);
+  if (hasOffset) {
+    const direct = dayjs(trimmed);
+    if (direct.isValid()) return direct.utc().toISOString();
+  }
+
+  try {
+    const zoned = dayjs.tz(trimmed, preferredTz);
+    if (zoned.isValid()) return zoned.utc().toISOString();
+  } catch {
+    // ignore tz parsing errors, fall through to generic parsing
+  }
+
+  const generic = dayjs(trimmed);
+  if (generic.isValid()) return generic.utc().toISOString();
+
+  return null;
+}
+
+// ----------------------------------------------
+// FFmpeg concurrency + configuration
+// ----------------------------------------------
+const FFMPEG_MAX_CONCURRENCY = parseInt(process.env.FFMPEG_MAX_CONCURRENCY || '2');
+const FFMPEG_OUTPUT_HZ = process.env.FFMPEG_OUTPUT_HZ || '16000'; // lower for smaller payloads
+let ffmpegActive = 0;
+const ffmpegQueue = [];
+function acquireFfmpegSlot() {
+  return new Promise(resolve => {
+    const tryStart = () => {
+      if (ffmpegActive < FFMPEG_MAX_CONCURRENCY) {
+        ffmpegActive++;
+        resolve();
+        return true;
+      }
+      return false;
+    };
+    if (!tryStart()) ffmpegQueue.push(tryStart);
+  });
+}
+function releaseFfmpegSlot() {
+  ffmpegActive = Math.max(0, ffmpegActive - 1);
+  while (ffmpegQueue.length && ffmpegActive < FFMPEG_MAX_CONCURRENCY) {
+    const starter = ffmpegQueue.shift();
+    if (starter) starter();
+  }
+}
 
 // --- AUTO SESSION EXPIRATION (4h) ---
 const MAX_SESSION_HOURS = parseInt(process.env.MAX_SESSION_HOURS || '4');
@@ -115,6 +244,296 @@ setInterval(() => {
     console.error('Auto session expiry error:', e);
   }
 }, 5 * 60 * 1000);
+
+// Kick off 45-minute Five9 ingestion scheduler with immediate startup run
+scheduleRecurringIngestion45();
+
+// Endpoint to manually trigger last hour report fetch (admin only)
+app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const result = await fetchLastHourCallLog({ auditUser: req.user });
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Endpoint to fix timezone on existing reporting data (admin only, one-time migration)
+app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const dayjs = (await import('dayjs')).default;
+    const utc = (await import('dayjs/plugin/utc.js')).default;
+    const timezone = (await import('dayjs/plugin/timezone.js')).default;
+    dayjs.extend(utc);
+    dayjs.extend(timezone);
+    
+    const sourceTimezone = req.body.sourceTimezone || process.env.FIVE9_TIMEZONE || 'America/New_York';
+    const batchSize = parseInt(req.body.batchSize || '10000', 10);
+    const runAll = req.body.runAll !== false; // default true
+    const deleteInvalidYears = req.body.deleteInvalidYears !== false; // default true
+    
+    console.log(`[TIMEZONE FIX] Starting migration from ${sourceTimezone} to UTC, batch size: ${batchSize}, runAll: ${runAll}, deleteInvalidYears: ${deleteInvalidYears}`);
+    
+    const { db } = await import('./database.js');
+    
+    let totalUpdated = 0;
+    let totalProcessed = 0;
+    let totalErrors = 0;
+    let totalDeleted = 0;
+    let batchCount = 0;
+    
+    // First, delete records with invalid years (2026 or beyond)
+    if (deleteInvalidYears) {
+      try {
+        const currentYear = new Date().getFullYear();
+        const futureYear = currentYear + 1;
+        const deleteResult = db.prepare(`DELETE FROM reporting WHERE timestamp LIKE '${futureYear}%' OR timestamp LIKE '${futureYear + 1}%' OR timestamp LIKE '${futureYear + 2}%'`).run();
+        totalDeleted = deleteResult.changes || 0;
+        console.log(`[TIMEZONE FIX] Deleted ${totalDeleted} rows with invalid future years (${futureYear}+)`);
+      } catch (e) {
+        console.error('[TIMEZONE FIX] Error deleting invalid years:', e.message);
+      }
+    }
+    
+    const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
+    
+    do {
+      batchCount++;
+      // Get rows that look like they haven't been converted yet (no 'T' or 'Z' in timestamp, or specific patterns)
+      // Or just process all rows - the update will only happen if timestamp changes
+      const rows = db.prepare(`SELECT call_id, timestamp FROM reporting WHERE timestamp IS NOT NULL ORDER BY datetime(timestamp) DESC LIMIT ? OFFSET ?`).all(batchSize, totalProcessed);
+      
+      if (rows.length === 0) {
+        console.log(`[TIMEZONE FIX] No more rows to process`);
+        break;
+      }
+      
+      console.log(`[TIMEZONE FIX] Batch ${batchCount}: Processing ${rows.length} rows (offset ${totalProcessed})`);
+      
+      let batchUpdated = 0;
+      let batchErrors = 0;
+      
+      for (const row of rows) {
+        try {
+          const rawTs = row.timestamp;
+          if (!rawTs) {
+            batchErrors++;
+            continue;
+          }
+          
+          // Skip if already in UTC ISO format (ends with Z)
+          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(rawTs)) {
+            // Already in correct UTC ISO format, skip
+            continue;
+          }
+          
+          // Try to parse with explicit format hints
+          let parsed = null;
+          const formats = [
+            'YYYY-MM-DD HH:mm:ss',
+            'M/D/YYYY HH:mm:ss',
+            'M/D/YYYY h:mm:ss A',
+            'MM/DD/YYYY HH:mm:ss',
+            'MM/DD/YYYY hh:mm:ss A',
+          ];
+          
+          for (const fmt of formats) {
+            const attempt = dayjs.tz(rawTs, fmt, sourceTimezone);
+            if (attempt.isValid() && attempt.year() >= 2020 && attempt.year() <= new Date().getFullYear() + 1) {
+              parsed = attempt;
+              break;
+            }
+          }
+          
+          // Fallback: try timezone-aware parsing without format
+          if (!parsed) {
+            parsed = dayjs.tz(rawTs, sourceTimezone);
+          }
+          
+          if (parsed && parsed.isValid()) {
+            const utcIso = parsed.utc().toISOString();
+            // Only update if actually different
+            if (utcIso !== rawTs) {
+              updateStmt.run(utcIso, row.call_id);
+              batchUpdated++;
+              if (totalUpdated < 5) {
+                console.log(`[TIMEZONE FIX] ${row.call_id}: "${rawTs}" -> "${utcIso}"`);
+              }
+            }
+          } else {
+            batchErrors++;
+            if (batchErrors <= 3) {
+              console.warn(`[TIMEZONE FIX] Could not parse: "${rawTs}"`);
+            }
+          }
+        } catch (e) {
+          batchErrors++;
+          if (batchErrors <= 3) {
+            console.error(`[TIMEZONE FIX] Error processing row:`, e.message);
+          }
+        }
+      }
+      
+      totalProcessed += rows.length;
+      totalUpdated += batchUpdated;
+      totalErrors += batchErrors;
+      
+      console.log(`[TIMEZONE FIX] Batch ${batchCount} complete: ${batchUpdated} updated, ${batchErrors} errors. Total so far: ${totalUpdated}/${totalProcessed}`);
+      
+      if (!runAll) {
+        // Single batch mode
+        break;
+      }
+      
+      // Continue if there might be more rows
+      if (rows.length < batchSize) {
+        console.log(`[TIMEZONE FIX] Last batch was smaller than batch size, done`);
+        break;
+      }
+      
+    } while (runAll);
+    
+    console.log(`[TIMEZONE FIX] Complete: ${totalUpdated} rows updated out of ${totalProcessed} processed, ${totalErrors} errors, ${totalDeleted} deleted`);
+    
+    res.json({ 
+      success: true, 
+      processed: totalProcessed, 
+      updated: totalUpdated,
+      deleted: totalDeleted,
+      errors: totalErrors,
+      batches: batchCount,
+      message: `Deleted ${totalDeleted} invalid records. Converted ${totalUpdated} timestamps from ${sourceTimezone} to UTC across ${batchCount} batch(es)`
+    });
+  } catch (e) {
+    console.error('[TIMEZONE FIX] Error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Query reports with filters
+app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
+  try {
+    let { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0, timezone: userTimezone } = req.query;
+    
+    // Clean up "undefined" strings
+    const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
+    start = cleanParam(start);
+    end = cleanParam(end);
+    agent = cleanParam(agent);
+    campaign = cleanParam(campaign);
+    callType = cleanParam(callType);
+    ani = cleanParam(ani);
+    dnis = cleanParam(dnis);
+    
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
+    
+    // Convert Five9 format to SQLite ISO format
+    // "Thu, 23 Oct 2025 12:47:37" -> "2025-10-23 12:47:37"
+    const five9ToISO = (dateStr) => {
+      if (!dateStr) return null;
+      try {
+        // Use dayjs to parse Five9 format and convert to ISO
+        const parsed = dayjs(dateStr, 'ddd, DD MMM YYYY HH:mm:ss');
+        if (!parsed.isValid()) return null;
+        return parsed.format('YYYY-MM-DD HH:mm:ss');
+      } catch (e) {
+        console.warn('[five9ToISO] Failed to parse:', dateStr, e.message);
+        return null;
+      }
+    };
+    
+    const startFormatted = five9ToISO(start);
+    const endFormatted = five9ToISO(end);
+    
+    if (startFormatted || endFormatted) {
+      console.log(`[API /api/reports] Formatted for SQLite: start="${startFormatted}", end="${endFormatted}"`);
+    }
+    
+    // Debug: check what's actually in the database
+    try {
+      const { db } = await import('./database.js');
+      const dbSample = db.prepare('SELECT timestamp FROM reporting ORDER BY rowid DESC LIMIT 3').all();
+      console.log('[API /api/reports] Recent timestamps in DB:', dbSample.map(r => r.timestamp));
+      
+      // Test if datetime parsing works
+      if (startFormatted) {
+        const testParse = db.prepare(`SELECT datetime(?) as parsed`).get(startFormatted);
+        console.log('[API /api/reports] Datetime parse test:', startFormatted, '->', testParse.parsed);
+      }
+    } catch (debugErr) {
+      console.warn('[API /api/reports] Debug query failed:', debugErr.message);
+    }
+    
+    const result = queryReports({ start: startFormatted, end: endFormatted, agent, campaign, callType, ani, dnis, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_VIEW',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          filters: {
+            start: start || null,
+            end: end || null,
+            agent: agent || null,
+            campaign: campaign || null,
+            callType: callType || null,
+            ani: ani || null,
+            dnis: dnis || null
+          },
+          pagination: { limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 },
+          returned: result.rows ? result.rows.length : 0,
+          total: result.total || 0
+        }
+      );
+    } catch (e) {
+      console.warn('REPORT_VIEW audit log failed:', e.message);
+    }
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Distinct meta for dropdowns
+app.get('/api/reports/meta', requireAuth, ensureSession, async (req, res) => {
+  try {
+    const campaigns = getDistinctCampaigns();
+    const callTypes = getDistinctCallTypes();
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_META_VIEW',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        { campaigns: campaigns.length, callTypes: callTypes.length }
+      );
+    } catch (e) {
+      console.warn('REPORT_META_VIEW audit log failed:', e.message);
+    }
+    res.json({ success:true, campaigns, callTypes });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Debug summary endpoint for reporting (admin only for safety)
+app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, (req, res) => {
+  try {
+    const summary = getReportingSummary();
+    res.json({ success:true, summary });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Public endpoint to get client configuration
 app.get('/api/config', (req, res) => {
@@ -312,6 +731,16 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
   try {
     const filename = decodeURIComponent(req.params[0]);
     const BUCKET_NAME = process.env.AWS_BUCKET;
+    const region = process.env.AWS_REGION;
+    const forceNoCache = req.query.nocache === '1' || req.query.force === '1';
+    const debugMode = req.query.debug === '1';
+    const requestId = crypto.randomBytes(4).toString('hex');
+    const startedTs = Date.now();
+    console.log(`🎧 [AUDIO][${requestId}] Incoming stream request file="${filename}" bucket=${BUCKET_NAME} region=${region} forceNoCache=${forceNoCache}`);
+    if (!BUCKET_NAME) {
+      console.error(`❌ [AUDIO][${requestId}] AWS_BUCKET not configured`);
+      return res.status(500).json({ error: 'Audio storage not configured' });
+    }
     
     console.log(`🎵 [STREAMING AUTH] User ${req.user.email} (${req.user.role || 'no-role'}) streaming: ${filename}`);
 
@@ -323,36 +752,76 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
     console.log(`📁 [CACHE KEY] Audio: ${cacheKey}, Waveform: ${waveformCacheKey}`);
 
     // Check if already cached
-    try {
-      await s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: cacheKey }));
-      
-      console.log(`⚡ [CACHE HIT] Serving from cache: ${cacheKey}`);
-      // Mark cacheHit for later single audit emission
-      req._playAudit = { cacheHit: true };
-      const range = req.headers.range;
-      const params = { Bucket: BUCKET_NAME, Key: cacheKey };
-      if (range) {
-        params.Range = range;
-        res.status(206);
+    if (!forceNoCache) {
+      const cachedHead = headCacheGet(cacheKey);
+      if (cachedHead) {
+        console.log(`⚡ [CACHE HIT][${requestId}] (HEAD cache) ${cacheKey}`);
+        req._playAudit = { cacheHit: true, cachedHead: true };
+        const range = req.headers.range;
+        const params = { Bucket: BUCKET_NAME, Key: cacheKey };
+        if (range) { params.Range = range; res.status(206); }
+        await acquireAudioS3();
+        try {
+          const cachedFetchStart = Date.now();
+          const cachedResponse = await s3.send(new GetObjectCommand(params));
+          console.log(`⚡ [CACHE FETCH][${requestId}] Stream start after ${Date.now()-cachedFetchStart}ms`);
+          res.setHeader('Content-Type', 'audio/wav');
+          res.setHeader('Accept-Ranges', 'bytes');
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
+          if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
+          if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
+          cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
+          res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
+          cachedResponse.Body.pipe(res);
+          releaseAudioS3();
+          return;
+        } catch (e) {
+          releaseAudioS3();
+          console.warn(`⚠️ [CACHE FETCH FAIL][${requestId}] proceeding to convert: ${e.message}`);
+        }
+      } else {
+        try {
+          const headStarted = Date.now();
+          await acquireAudioS3();
+          const headPromise = s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: cacheKey }));
+          const headResult = await Promise.race([
+            headPromise,
+            new Promise((_, reject) => setTimeout(()=> reject(new Error('Head timeout after 5000ms')), 5000))
+          ]);
+          releaseAudioS3();
+          if (headResult) {
+            headCacheSet(cacheKey, true);
+            console.log(`⚡ [CACHE HIT][${requestId}] Found cached file in ${Date.now()-headStarted}ms: ${cacheKey}`);
+            req._playAudit = { cacheHit: true };
+            const range = req.headers.range;
+            const params = { Bucket: BUCKET_NAME, Key: cacheKey };
+            if (range) { params.Range = range; res.status(206); }
+            await acquireAudioS3();
+            const cachedFetchStart = Date.now();
+            const cachedResponse = await s3.send(new GetObjectCommand(params));
+            releaseAudioS3();
+            console.log(`⚡ [CACHE FETCH][${requestId}] Stream start after ${Date.now()-cachedFetchStart}ms`);
+            res.setHeader('Content-Type', 'audio/wav');
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
+            if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
+            if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
+            cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
+            res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
+            cachedResponse.Body.pipe(res);
+            return;
+          }
+        } catch (e) {
+          releaseAudioS3();
+          console.log(`📦 [CACHE MISS][${requestId}] (${e.message}) Need to convert: ${s3Key}`);
+          req._playAudit = { cacheHit: false, headError: e.message };
+        }
       }
-      
-      const cachedCommand = new GetObjectCommand(params);
-      const cachedResponse = await s3.send(cachedCommand);
-
-      res.setHeader('Content-Type', 'audio/wav');
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
-      
-      if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
-      if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
-
-      cachedResponse.Body.pipe(res);
-      return;
-      
-    } catch {
-      console.log(`📦 [CACHE MISS] Need to convert and cache: ${s3Key}`);
-      req._playAudit = { cacheHit: false };
+    } else {
+      console.log(`🚫 [CACHE BYPASS][${requestId}] Forced conversion due to query param`);
+      req._playAudit = { cacheHit: false, forced: true };
     }
 
     // Emit a single consolidated PLAY_FILE audit event now that we know cache hit/miss
@@ -376,53 +845,105 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
 
     // Get the original file from S3
     const s3StartTime = Date.now();
-    const originalCommand = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key });
-    const originalResponse = await s3.send(originalCommand);
-    const s3FetchTime = Date.now() - s3StartTime;
-    console.log(`📦 [S3 FETCH] Retrieved file in ${s3FetchTime}ms`);
+    let originalResponse;
+    try {
+      const originalCommand = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key });
+      // Implement manual timeout using AbortController (AWS SDK v3 supports abortSignal)
+      const controller = new AbortController();
+      const timeoutMs = parseInt(process.env.AUDIO_S3_TIMEOUT_MS || '20000', 10);
+      const tHandle = setTimeout(() => {
+        controller.abort();
+      }, timeoutMs);
+      originalResponse = await s3.send(originalCommand, { abortSignal: controller.signal });
+      clearTimeout(tHandle);
+      const s3FetchTime = Date.now() - s3StartTime;
+      console.log(`📦 [S3 FETCH][${requestId}] Retrieved file in ${s3FetchTime}ms size=${originalResponse.ContentLength || 'unknown'} timeoutMs=${timeoutMs}`);
+    } catch (e) {
+      console.error(`❌ [S3 FETCH FAIL][${requestId}] ${e.name||''} ${e.message}`);
+      return res.status(404).json({ error: 'Original file not found', detail: e.message });
+    }
 
     // Convert and cache for seeking support
     const tmpCachePath = path.join(os.tmpdir(), cacheKey.replace(/\//g, '_'));
     
-    console.log(`🔄 [CONVERT] Starting FFmpeg WAV conversion: ${s3Key}`);
+  console.log(`🔄 [CONVERT][${requestId}] Starting FFmpeg WAV conversion: ${s3Key}`);
     const conversionStartTime = Date.now();
     
-    // FFmpeg command to convert and save to temp file
-    const ffmpeg = spawn('ffmpeg', [
-      '-i', 'pipe:0',           // Input from stdin
-      '-f', 'wav',              // WAV format 
-      '-acodec', 'pcm_s16le',   // PCM 16-bit 
-      '-ac', '1',               // Mono for faster processing
-      '-ar', '22050',           // Lower sample rate for faster processing
-      tmpCachePath              // Output to temp file
-    ]);
+    // Ensure we do not exceed concurrent ffmpeg processes
+    await acquireFfmpegSlot();
+    
+    const ffmpegArgs = [
+      '-hide_banner',
+      '-loglevel', debugMode ? 'info' : (process.env.FFMPEG_LOGLEVEL || 'warning'),
+      '-nostdin',
+      '-i', 'pipe:0',            // Input from stdin
+      '-fflags', '+discardcorrupt',
+      '-err_detect', 'ignore_err', // treat minor decode errors as non-fatal
+      '-f', 'wav',
+      '-acodec', 'pcm_s16le',
+      '-ac', '1',
+      '-ar', FFMPEG_OUTPUT_HZ,
+      '-y',                      // overwrite temp file if exists
+      tmpCachePath
+    ];
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+  console.log(`🎬 [FFMPEG SPAWN][${requestId}] cmd=ffmpeg args=${ffmpegArgs.join(' ')}`);
 
     // Error handling
     ffmpeg.stderr.on('data', (data) => {
-      console.error(`FFmpeg stderr: ${data}`);
+      const msg = data.toString();
+      if (/Packet is too small/i.test(msg)) {
+        console.warn(`⚠️  [FFmpeg WARN][${requestId}] ${msg.trim()}`);
+      } else {
+        console.log(`[FFmpeg][stderr][${requestId}] ${msg.trim()}`);
+      }
     });
 
     ffmpeg.on('error', (error) => {
-      console.error('❌ [FFmpeg ERROR]:', error);
+      console.error(`❌ [FFmpeg ERROR][${requestId}]:`, error);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Audio conversion failed' });
       }
       if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
+      releaseFfmpegSlot();
     });
 
     // Stream input to FFmpeg
+    let sourceEnded = false;
+    originalResponse.Body.on('error', e => {
+      console.error(`❌ [S3 BODY ERR][${requestId}]`, e.message);
+      try { ffmpeg.stdin.destroy(e); } catch {}
+    });
+    originalResponse.Body.on('end', () => {
+      sourceEnded = true;
+      console.log(`📥 [S3 BODY END][${requestId}] upstream complete`);
+      try { ffmpeg.stdin.end(); } catch {}
+    });
     originalResponse.Body.pipe(ffmpeg.stdin);
+    console.log(`🔌 [PIPE][${requestId}] S3->FFmpeg piping established`);
 
     ffmpeg.on('close', async (code) => {
       const conversionTime = Date.now() - conversionStartTime;
-      console.log(`⏱️ [CONVERSION] Completed in ${conversionTime}ms`);
+      console.log(`⏱️ [CONVERSION][${requestId}] Completed in ${conversionTime}ms exitCode=${code}`);
+      if (!sourceEnded) {
+        console.log(`⚠️ [CONVERSION][${requestId}] FFmpeg closed before source end (sourceEnded=${sourceEnded})`);
+      }
       
-      if (code !== 0) {
-        console.error(`❌ FFmpeg process exited with code ${code}`);
+      // Even if non-zero, sometimes partial output exists; validate file size
+      let tmpOk = false;
+      try {
+        if (fs.existsSync(tmpCachePath)) {
+          const st = fs.statSync(tmpCachePath);
+            tmpOk = st.size > 1024; // require minimal size
+        }
+      } catch {}
+      if (code !== 0 && !tmpOk) {
+  console.error(`❌ [FFMPEG BAD OUTPUT][${requestId}] exitCode=${code} sizeInvalid`);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Failed to convert audio' });
         }
         if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
+        releaseFfmpegSlot();
         return;
       }
 
@@ -436,7 +957,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           ContentType: 'audio/wav'
         }));
         
-        console.log(`✅ [CACHED] Uploaded to S3 cache: ${cacheKey}`);
+  console.log(`✅ [CACHED][${requestId}] Uploaded to S3 cache: ${cacheKey} size=${fileData.length}`);
         
         // Now serve the file with range support
         const range = req.headers.range;
@@ -454,6 +975,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           res.setHeader('Accept-Ranges', 'bytes');
           
           res.end(fileData.slice(start, end + 1));
+          console.log(`📤 [RANGE SERVE][${requestId}] bytes=${chunksize} range=${start}-${end}`);
         } else {
           // Serve full file
           res.setHeader('Content-Type', 'audio/wav');
@@ -463,6 +985,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
           
           res.end(fileData);
+          console.log(`📤 [FULL SERVE][${requestId}] bytes=${fileData.length}`);
         }
         
         // Clean up temp file
@@ -475,6 +998,8 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
         }
         if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
       }
+      releaseFfmpegSlot();
+      console.log(`🏁 [AUDIO DONE][${requestId}] totalMs=${Date.now()-startedTs}`);
     });
   } catch (err) {
     console.error('Error streaming S3 file:', err);
@@ -930,12 +1455,12 @@ app.get('/api/audit-logs', requireAuth, ensureSession, requireAdmin, (req, res) 
       offset = 0
     } = req.query;
 
-    const auditLogs = getAuditLogs(
+    const { rows: auditLogs, total } = getAuditLogs(
       userId || null,
       actionType || null,
       startDate || null,
       endDate || null,
-      callId || null, // LIKE filtering handled in prepared statement
+      callId || null,
       parseInt(limit),
       parseInt(offset)
     );
@@ -943,13 +1468,89 @@ app.get('/api/audit-logs', requireAuth, ensureSession, requireAdmin, (req, res) 
     res.json({
       logs: auditLogs,
       pagination: {
+        total,
         limit: parseInt(limit),
         offset: parseInt(offset),
-        hasMore: auditLogs.length === parseInt(limit)
+        hasMore: parseInt(offset) + auditLogs.length < total
       }
     });
   } catch (err) {
     console.error('Error getting audit logs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/audit-logs/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const {
+      userId,
+      actionType,
+      startDate,
+      endDate,
+      callId
+    } = req.query;
+
+    const exportResult = exportAuditLogs({
+      userId: userId || null,
+      actionType: actionType || null,
+      startDate: startDate || null,
+      endDate: endDate || null,
+      callId: callId || null
+    });
+
+    if (exportResult.error) {
+      throw new Error(exportResult.error);
+    }
+
+    if (exportResult.truncated) {
+      return res.status(400).json({
+        error: `Too many matching audit rows (${exportResult.total}). Narrow your filters to export fewer than ${exportResult.maxRows} rows.`,
+        total: exportResult.total,
+        maxRows: exportResult.maxRows
+      });
+    }
+
+    const nowIso = new Date().toISOString().replace(/[:]/g, '-');
+    const csv = buildCsv(exportResult.rows, [
+      { key: 'id', header: 'id' },
+      { key: 'user_id', header: 'user_id' },
+      { key: 'user_email', header: 'user_email' },
+      { key: 'action_type', header: 'action_type' },
+      { key: 'file_path', header: 'file_path' },
+      { key: 'call_id', header: 'call_id' },
+      { key: 'action_timestamp', header: 'action_timestamp' },
+      { key: 'ip_address', header: 'ip_address' },
+      { key: 'user_agent', header: 'user_agent' },
+      { key: 'session_id', header: 'session_id' },
+      { key: 'additional_data', header: 'additional_data' }
+    ]);
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_DOWNLOAD',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'audit_logs',
+          filters: { userId: userId || null, actionType: actionType || null, startDate: startDate || null, endDate: endDate || null, callId: callId || null },
+          exported: exportResult.rows.length
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_DOWNLOAD audit log failed:', auditErr.message);
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="audit-logs-${nowIso}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Error exporting audit logs:', err);
+    if (res.headersSent) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -964,6 +1565,138 @@ app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin
   } catch (e) {
     console.error('Error backfilling audit call_ids:', e);
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const rows = getUserUsageReport(startDate || null, endDate || null);
+
+    const payloadRows = rows.map(row => ({
+      userId: row.user_id,
+      userEmail: row.user_email,
+      totalActions: row.total_actions,
+      loginCount: row.login_count,
+      logoutCount: row.logout_count,
+      playCount: row.play_count,
+      downloadCount: row.download_count,
+      viewCount: row.view_count,
+      reportViewCount: row.report_view_count,
+      reportDownloadCount: row.report_download_count,
+      lastActionAt: row.last_action_at,
+      totalSessionMs: row.total_session_ms,
+      totalSessionMinutes: row.total_session_ms ? Math.round(row.total_session_ms / 60000) : 0
+    }));
+
+    const summary = payloadRows.reduce((acc, row) => {
+      acc.totalUsers += 1;
+      acc.totalActions += row.totalActions;
+      acc.loginCount += row.loginCount;
+      acc.downloadCount += row.downloadCount;
+      acc.playCount += row.playCount;
+      acc.reportViewCount += row.reportViewCount;
+      acc.reportDownloadCount += row.reportDownloadCount;
+      acc.totalSessionMinutes += row.totalSessionMinutes;
+      return acc;
+    }, {
+      totalUsers: 0,
+      totalActions: 0,
+      loginCount: 0,
+      downloadCount: 0,
+      playCount: 0,
+      reportViewCount: 0,
+      reportDownloadCount: 0,
+      totalSessionMinutes: 0
+    });
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_VIEW',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'user_usage',
+          filters: { startDate: startDate || null, endDate: endDate || null },
+          returned: payloadRows.length
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_VIEW audit log failed:', auditErr.message);
+    }
+
+    res.json({ success: true, rows: payloadRows, summary });
+  } catch (err) {
+    console.error('Error loading user usage report:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireAdmin, (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const exportResult = exportUserUsageReport(startDate || null, endDate || null);
+
+    if (exportResult.truncated) {
+      return res.status(400).json({
+        error: `Too many users (${exportResult.total}) to export. Narrow the date range to fewer than ${exportResult.maxRows} rows.`,
+        total: exportResult.total,
+        maxRows: exportResult.maxRows
+      });
+    }
+
+    const nowIso = new Date().toISOString().replace(/[:]/g, '-');
+    const csv = buildCsv(exportResult.rows, [
+      { key: 'user_id', header: 'user_id' },
+      { key: 'user_email', header: 'user_email' },
+      { key: 'total_actions', header: 'total_actions' },
+      { key: 'login_count', header: 'login_count' },
+      { key: 'logout_count', header: 'logout_count' },
+      { key: 'play_count', header: 'play_count' },
+      { key: 'download_count', header: 'download_count' },
+      { key: 'view_count', header: 'view_count' },
+      { key: 'report_view_count', header: 'report_view_count' },
+      { key: 'report_download_count', header: 'report_download_count' },
+      { key: 'last_action_at', header: 'last_action_at' },
+      {
+        key: 'total_session_ms',
+        header: 'total_session_minutes',
+        accessor: (row) => row.total_session_ms ? Math.round(row.total_session_ms / 60000) : 0
+      }
+    ]);
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_DOWNLOAD',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'user_usage',
+          filters: { startDate: startDate || null, endDate: endDate || null },
+          exported: exportResult.rows.length
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_DOWNLOAD audit log failed:', auditErr.message);
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="user-usage-${nowIso}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Error exporting user usage report:', err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: err.message });
   }
 });
 
