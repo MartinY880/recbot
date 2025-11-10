@@ -1,326 +1,238 @@
-# RecBot - Audio Recording Management & Audit Platform
+# Nxt Lnk
 
-**Version: v1.5.x (current dev branch)**
+**Custom bio links for creatives who love coding. Made this first to use for my own weblinks vjy.me/lnk**
 
-RecBot is a production-focused web platform for browsing, filtering, auditing, and playing large volumes of telephony call recordings stored in cloud object storage. It includes structured metadata extraction (duration, call ID), session tracking, full audit logging, and performance‑oriented server‑side querying.
+A perfect custom alternative for linktree, bio and other shortner platform. Check live version here [nxtlnk.xyz](https://nxtlnk.xyz)
 
-## Features
+Pull requests are always welcome. In case you want inspiration or new features on what to add, check out the issues for feature requests.
 
-### 🎵 Audio Management
-- **Stream Audio Files**: Play recordings directly in the browser with seek support
-- **Format Support**: Automatically transcodes telephony formats to browser-compatible PCM
-- **Range Requests**: Supports audio scrubbing and seeking with HTTP Range headers
-- **S3 Caching**: Transcoded files are cached in S3 for improved performance
+Coffee fuels coding ☕️
 
-### 🔍 Advanced Filtering & Search
-- **Date Range Filtering**: Filter recordings by specific dates or date ranges
-- **Phone Number Search**: Find recordings by caller phone number
-- **Email Search**: Search by agent email address
-- **Duration Filtering**: Filter by minimum or maximum call duration
-- **Time-based Filtering**: Filter by time of day with multiple modes (range, older than, newer than)
+<a href="https://www.buymeacoffee.com/realvjy" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
-### 📊 Data Management
-- **Backend Pagination**: Efficient offset-based pagination for large datasets (10,000+ files)
-- **Sorting**: Click any column header to sort by date, time, phone, email, or duration
-- **Real-time Filtering**: All filters apply immediately without page refresh
-- **Flexible Page Sizes**: Choose from 25, 50, 100, 250, 500, or 1000 files per page
-
-### 🎨 User Interface
-- **Dark/Light Mode**: Toggle between themes
-- **Responsive Design**: Works on desktop and mobile devices
-- **Material UI**: Modern, accessible interface components
-- **Loading States**: Visual feedback during data loading
-
-### 🔐 Authentication & Authorization
-- **Clerk Authentication**: Email/domain restricted sign‑in (e.g. only approved company domain)
-- **Role-Based Access**: Admin, manager, member tiers (download & admin visibility controlled)
-- **Session Lifecycle**: Automatic inactivity timeout & hard session expiration with rotation
-- **Secure Playback & Download Logging**: Each access event audited with IP & session linkage
-
-### ☁️ Cloud & Storage
-- **AWS S3**: Primary storage & streaming source
-- **On-Demand Transcoding**: FFmpeg WAV normalization (caching layer possible)
-- (Legacy references to B2/SFTP removed for current deployment scope)
-
-## Architecture
-
-### Backend (Node.js / Express)
-- **Port**: 4000 (served behind reverse proxy / container)
-- **Database**: SQLite (better-sqlite3) with on‑startup adaptive migrations
-- **Audio Processing**: FFmpeg for transcoding & stream trimming (Range support)
-- **Object Storage**: AWS S3 via AWS SDK v3
-- **Auth Middleware**: Clerk + custom role guards
-- **Session Engine**: user_sessions table + inactivity & duration expirers
-- **Audit Layer**: audit_logs table (LOGIN, LOGOUT with reasons, VIEW_FILES, PLAY_FILE, DOWNLOAD_FILE, MAINTENANCE)
-
-### Frontend (React)
-- **React 18 + Material UI**: Responsive data & admin dashboards
-- **Filtering UX**: Debounced substring filters (phone, email, callId)
-- **Call ID Highlighting**: Partial match highlighting in audit logs
-- **Clerk Frontend SDK**: Auth gating & role awareness
-- **Session / Audit Visibility**: Admin panel for real‑time log & session review
-
-### Infrastructure
-- **Containerization**: Docker multi‑stage image
-- **Reverse Proxy**: (Traefik / Nginx compatible)
-- **Environment Driven Config**: Minimal required variables
-- **Optional CDN**: Cloud distribution of audio objects (not required to run)
-
-## Installation / Deployment
-
-### Prerequisites
-- Docker and Docker Compose
-- AWS S3 bucket OR Backblaze B2 bucket
-- Domain name (for production)
-
-### Environment Variables
-
-Create a `.env` file in the root directory:
-
-```env
-# Storage Configuration (choose one)
-STORAGE_TYPE=aws  # or "b2" for Backblaze B2
-
-# AWS S3 Configuration
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_BUCKET=your-bucket-name
-AWS_REGION=us-east-1
-
-# Backblaze B2 Configuration (if using B2)
-B2_ACCOUNT=your_b2_account_id
-B2_KEY=your_b2_application_key
-B2_BUCKET=your-b2-bucket-name
-
-# SFTP Configuration (optional)
-ENABLE_SFTP=true
-SFTP_USER=your_sftp_username
-SFTP_PASS=your_sftp_password
-
-CLERK_PUBLISHABLE_KEY=your_clerk_publishable_key
-CLERK_SECRET_KEY=your_clerk_secret_key
-ALLOWED_EMAIL_DOMAIN=yourcompany.com
-MAX_SESSION_HOURS=4
-MAX_INACTIVITY_MINUTES=30
-
-# File Storage
-WAV_DIR=/data/wav
-```
-
-### Quick Start
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/dellthePROgrammer/recbot.git
-   cd recbot
-   ```
-
-2. **Configure environment**:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your configuration
-   ```
-
-3. **Build and start**:
-   ```bash
-   docker-compose up -d
-   ```
-
-4. **Access the application**:
-   - Frontend: http://localhost:3000 (or served statically by backend build path)
-   - Backend API: http://localhost:4000
-
-### Production Docker Hub Image
-
-Use the pre-built image from Docker Hub:
-
-```yaml
-version: '3.8'
-services:
-  recbot:
-   image: ghostreaper69/recbot:v1.5.23
-    # or use: ghostreaper69/recbot:latest
-    ports:
-      - "4000:4000"
-    environment:
-      - STORAGE_TYPE=aws
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_BUCKET=${AWS_BUCKET}
-      - AWS_REGION=${AWS_REGION}
-    volumes:
-      - wav_data:/data/wav
-      - db_data:/root/db
-```
-
+**Table of Contents**
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+  - [Usage](#usage)
+  - [Quick Start](#quick-start)
+  - [Manual Setup](#manual-setup)
+  - [Getting Started](#getting-started)
+  - [Images](#images)
+  - [Update Bio](#update-bio)
+    - [Add/Update](#update-bio)
+    - [Enable/Disable](#update-bio)
+    - [Featured Banner](#update-bio)
+  - [Update Links](#update-links)
+    - [Enable/Disable](#update-links)
+    - [Add/Update](#update-links)
+  - [Frontend](#frontend)
+  - [SEO](#seo)
+  - [Google Analytics](#google-analytics)
+  - [Custom Domain](#custom-domain)
+  - [Favicon](#favicon)
+  - [Contributors](#contributors)
+  
+  
 ## Usage
+`nxt-lnk` template used to create your custom bio link and self-host on Vercel or Netlify using your own domain. Need little understanding of code :) ☕
 
-### File & Metadata Model
+Usually, you don't need to worry a lot about coding if you're just updating information in `BioData.js` and `LinkData.js`. To deep dive know more  [Next.js](https://nextjs.org/docs) and [React](https://reactjs.org/docs/getting-started.html) official documentaion.
 
-Recordings organized by date folders (M_D_YYYY):
-```
-recordings/
-├── 9_26_2025/
-│   ├── 2012055255 by user@domain.com @ 9_47_43 AM_18600.wav
-│   ├── 2012079443 by user@domain.com @ 9_33_50 AM_4200.wav
-│   └── ...
-├── 9_27_2025/
-│   └── ...
-```
+For customization used [styled components](https://styled-components.com/). If you want to customize styling you can [learn more here](https://styled-components.com/docs).
 
-**Primary Filename Formats**:
+**Template auto support dark-mode depending on system cofig.**
 
-1. Legacy: `{phone} by {email} @ {H_MM_SS AM|PM}_{duration_ms}.wav`
-2. New (with callId): `{phone} by {email} @ {H_MM_SS AM|PM}_{duration_ms}_{callId}.wav`
+## Quick Start
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/import/git?s=https://github.com/realvjy/nxt-lnk) [![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/realvjy/nxt-lnk)
 
-Parsed Fields:
-- phone
-- email
-- call_date (derived from folder)
-- call_time (normalized HH:MM:SS 24h)
-- duration_ms
-- call_id (optional legacy absence)
 
-Backfill routines populate missing `call_id` and `duration_ms` where recoverable.
-
-### API Endpoints
-
-#### Get Files
-```http
-GET /api/wav-files?dateStart=9_26_2025&dateEnd=9_27_2025&offset=0&limit=25
-```
-
-Key Query Parameters (files):
-- dateStart, dateEnd (M_D_YYYY)
-- offset, limit
-- phone, email (substring match)
-- callId (substring match)
-- durationMin (minimum duration in seconds)
-- timeStart, timeEnd (if timeMode=range)
-- sortColumn: date | time | phone | email | durationMs | callId
-- sortDirection: asc | desc
-
-#### Stream Audio
-```http
-GET /api/wav-files/recordings/9_26_2025/filename.wav
-```
-
-Supports HTTP Range requests for audio seeking.
-
-### Authentication Setup (Clerk)
-
-1. Create a Clerk application → obtain Publishable & Secret keys.
-2. Configure allowed email domain restriction (or enforce in middleware with ALLOWED_EMAIL_DOMAIN).
-3. Add keys to environment (.env or container env vars).
-4. Deploy – frontend uses Clerk React SDK; backend validates JWT / session via Clerk middleware.
-
-## Development
-
-### Local Development
-
-1. **Install dependencies**:
-   ```bash
-   cd backend && npm install
-   cd ../frontend && npm install
-   ```
-
-2. **Start development servers**:
-   ```bash
-   # Backend (port 4000)
-   cd backend && npm start
-   
-   # Frontend (port 3000)
-   cd frontend && npm start
-   ```
-
-### Building Docker Image
-
+## Manual Setup
+Run the following command to create a new project with this template:
 ```bash
-# Build with version tag
-docker build -t ghostreaper69/recbot:v1.1.0 .
-
-# Push to Docker Hub
-docker push ghostreaper69/recbot:v1.1.0
+yarn create next-app your-app-name -e https://github.com/realvjy/nxt-lnk
+# or
+npx create-next-app your-app-name -e https://github.com/realvjy/nxt-lnk
 ```
 
-## Performance & Scaling
+## Getting Started
 
-### Optimizations
-- Server-side filtering & ordering via indexed SQLite queries
-- Partial LIKE matching (phone, email, callId) with pragmatic indexes
-- Session pruning tasks prevent table bloat
-- Optional caching layer for transcoded outputs (future optimization)
+Use any editor to work on editing. I use [vscode](https://code.visualstudio.com/)
 
-### Scaling Considerations
-- Designed for hundreds of thousands of rows (WAL mode, tuned pragmas advisable)
-- Add covering indexes if new heavy filters introduced
-- Potential future move: shard or externalize to Postgres when concurrency demands it
-- CDN or signed URLs for global latency reduction if required
-
-## Troubleshooting
-
-### Common Issues
-
-**Files not loading**:
-- Check S3/B2 credentials and bucket permissions
-- Verify file structure matches expected format
-- Check Docker container logs: `docker-compose logs recbot`
-
-**Authentication not working**:
-- Verify Clerk keys & domain restrictions
-- Confirm frontend and backend share the same Clerk environment settings
-
-**Audio not playing**:
-- Check FFmpeg installation in container
-- Verify audio file formats are supported
-- Check browser console for errors
-
-### Logs
-
+First, run the development server:
 ```bash
-# View all logs
-docker-compose logs -f
-
-# View specific service logs
-docker-compose logs -f recbot
+npm run dev
+# or
+yarn dev
 ```
 
-## Contributing
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature-name`
-3. Make your changes
-4. Run tests: `npm test`
-5. Submit a pull request
+**Important files to edit or update info**
+`data/BioData.js` All basic info update here
+`data/LinksData.js` Contain all the links
+`Components/WebLinks.js` UI and stylesheet
+`Components/icons/index.js` Contain all SVG icon compo
 
-## License
+You can start editing the page by modifying `data/BioData.js` and `data/LinksData.js`. The page auto-updates as you edit the file.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Support
 
-For issues and questions:
-- Create an issue on GitHub
-- Check the troubleshooting section
-- Review Docker container logs
+## Images
+All images stored inside `public` folder of the project.
 
-## Changelog
+## Update Bio
+**Example from** `BioData.js` :
+```jsx
+const bioData = [
+    {
+        name: 'vijay verma',
+        username: '@realvjy',
+        url: 'https://vjy.me',
+        titleImg: true,
+        avatar: '/avatar.png',
+        nftAvatar: true,
+        description: 'A short description/bio about you goes here',
+        subdesc: 'This is secondary description. If you do not need, you can remove it',
+        newProductUrl: 'https://vjy.me/lnk',
+        newProduct: true,
+    },
+];
 
-### Recent Highlights (v1.5.x series)
-- Call ID extraction & backfill
-- Substring filtering for audit & file callId
-- Admin session & audit dashboards
-- Inactivity + auto-expire session logic
-- Consolidated playback/download audit entries
-- IP resolution behind proxy (Cloudflare / Traefik)
-- Backfill endpoints (sessions & file metadata)
+export default bioData;
+```
+**Avatar**
+Just replace `avatar.png`. 200x200px will be good.
 
-### Earlier Milestones
-- Initial pagination & sorting foundation
-- Filename parsing & duration capture
-- Role-based access control
-- Core audio streaming + range seeking
+**Hex/NFT avatar view**
+`nftAvatar: true` enable hex shape on avatar image.
+`nftAvatar: false` made it in oval shape.
 
----
+**Title**
+By default `titleImg: true` and it look for `title.svg`. Replace svg with logo **logo**. Make sure to use `title.svg ` name.
 
-**Built for operational clarity, compliance, and speed.**
+**Featured banner**
+`newProductUrl` and `newProduct` used for getting featured banner. You can replace the image `newproduct.png`  with any design you like.
+
+`newProduct: true` show banner. Default is `true` make it false to hide.
+
+
+## Update Links
+**Example from** `LinksData.js` :
+```jsx
+const webLinks = [
+    // All social profile
+    {
+        title: 'Twitter',
+        url: 'https://twitter.com/realvjy',
+        type: 'social',
+        icon: '/twitter.svg',
+        on: true
+    },
+    ...
+    ...
+    
+    {
+        title: 'Instagram',
+        url: 'https://instagram.com/realvjy',
+        type: 'social',
+        icon: '/insta.svg',
+        on: true
+    }
+];
+export default webLinks;
+```
+**Enable/Disable Social Media**
+Find `type: social` and change `on:true|false`
+
+| Title           | on (default)    | 
+| ---------       | --------        | 
+| `Twitter`       | `true`          | 
+| `Instagram`     | `true`          | 
+| `Dribbble`      | `false`          | 
+| `Medium`        | `false`          | 
+| `Github`        | `true`          | 
+| `Youtube`       | `false`          | 
+| `Behance`       | `true`          | 
+| `Figma`         | `true`          | 
+| `Linkedin`      | `false`          | 
+| `Mastodon`      | `false`          | 
+| `Hive Social`    | `false`          | 
+| `Post.news`      | `false`          | 
+
+Setting `on: true` show the social icon. 
+The social media icons are arranged in a single row at the top of the page below description. If you want to use as list, chagne type to `type: 'other'`
+
+**Add new Social Media link**
+create a new block by copying this
+```jsx
+    {
+        title: 'Social Name',
+        url: 'https://link.com/whateverurl',
+        type: 'social',
+        icon: '/newiconname.svg',
+        on: true
+    }
+```
+Update all info and make sure to add a `newiconname.svg` file in [public](#images) folder.
+Then you have to add new section to frontend `components/WebLinks.js`
+
+## Frontend
+All frontend customization done inside `components/WebLinks.js`. If you wante to update and add new section just look this file and update according to your need.
+
+**Update section**
+
+Look for Section codes. Like if you want to change `install` type to `featured` Update  the `type: 'featured'` in `LinkData.js` then update all `install` related code in `WebLinks.js` to `featured`
+
+```js
+// Collect all links filter by type - social, project, nft and other etc=
+// get data for install section
+const install = allLinks.filter((el) => {
+  return el.type === "install" && el.on
+});
+
+...
+...
+
+{/* Featured Section */ }
+<LinkSection>
+  <h3>{install[0].type}</h3>
+  {
+    install.map((i) => {
+      return (
+        <Link href={i.url} passHref key={i.title}>
+          <LinkBox>
+            <LinkTitle><img src={i.icon} style={{ filter: 'var(--img)' }} /> {i.title}</LinkTitle> <NewUp />
+          </LinkBox>
+        </Link>
+      )
+    })
+  }
+</LinkSection>
+{/* End Featured Section */ }
+```
+**Add New section**
+
+Add new section with specific `type` in `Linkdata.js`. Then copy `LinkSection` Code to create new section in `WebLinks.js` file. Make sure to create get data of that section as well.
+      
+## SEO
+Already added `next-seo`. All you have to do is `update next-seo.config.js` file. Make sure to add direct link of `preview.jpg`file, like - `https://vjy.me/preview.jpg`.
+
+## Google Analytics
+In Vercel, you can set this by going to your project, then Settings and finally [Environments Variables](https://vercel.com/docs/concepts/projects/environment-variables). To get GA 4 code `G-ZXX0000XXX` follow [these steps ](https://support.google.com/analytics/answer/9304153?hl=en)
+
+<img src="https://vjy.me/ga-analytics.png" style="width: 500px !important;"/>
+
+
+## Custom Domain
+By default vercel give you a subdomain with your project name like - [nxtlnk.vercel.app](https:nxtlnk.vercel.app). But you can add own domain. 
+
+Vercel/Netlify give you option to add any domain to the deployed project like [vjy.me/lnk](https://vjy.me/lnk) or [nxtlnk.xyz](https://nxtlnk.xyz). All you have to do is follow official [Vercel documentaion](https://vercel.com/docs/concepts/projects/domains/add-a-domain) or [Netlify Documentaion](https://www.netlify.com/blog/2021/12/20/how-to-add-custom-domains-to-netlify-sites/)
+
+## Favicon
+Create a `favicon.ico` file and place inside `public` folder. I use [favicon.io](https://favicon.io/favicon-converter/)
+
+## Contributors
+Created by [realvjy](https://twitter.com/realvjy). You are always welcome to share your feedback on twitter or any social media platform.
+
+If you want to contribute. Just create a pull request. 
+    
